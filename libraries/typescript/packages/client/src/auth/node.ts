@@ -160,6 +160,12 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   /** Latest deferred (settled or in-flight) for the loopback response. */
   private lastFlow: Deferred<NodeOAuthAuthorizationResponse> | null = null;
   private pendingTimer: NodeJS.Timeout | null = null;
+  /**
+   * Synchronously set before the first `await` in `redirectToAuthorization()`
+   * to reserve the authorization slot. Prevents a second concurrent call from
+   * passing the `pending` check while the first is still initializing.
+   */
+  private authorizing = false;
 
   private constructor(
     serverUrl: string,
@@ -372,27 +378,37 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * the browser-open attempt completes.
    */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
-    if (this.pending) {
+    if (this.pending || this.authorizing) {
       throw new Error(
         "NodeOAuthClientProvider: an authorization is already in progress"
       );
     }
 
-    if (this.shouldPersistSelectedPort) {
-      await this.kv.set("port", String(this.port));
-      this.shouldPersistSelectedPort = false;
+    // Reserve the slot synchronously before any await so that concurrent
+    // callers observe `authorizing === true` and are rejected immediately.
+    this.authorizing = true;
+
+    try {
+      if (this.shouldPersistSelectedPort) {
+        await this.kv.set("port", String(this.port));
+        this.shouldPersistSelectedPort = false;
+      }
+
+      const sanitizedUrl = await this.session.storeAuthorizationState(
+        authorizationUrl,
+        { flowType: "redirect" }
+      );
+      this.authorizationUrl = sanitizedUrl;
+
+      await this.startLoopback();
+    } catch (err) {
+      this.authorizing = false;
+      throw err;
     }
-
-    const sanitizedUrl = await this.session.storeAuthorizationState(
-      authorizationUrl,
-      { flowType: "redirect" }
-    );
-    this.authorizationUrl = sanitizedUrl;
-
-    await this.startLoopback();
 
     this.pending = createDeferred<NodeOAuthAuthorizationResponse>();
     this.lastFlow = this.pending;
+    this.authorizing = false;
     // Swallow unhandled rejections — callers may not subscribe before the
     // callback fires, but `getAuthorizationCode()` still returns the same
     // settled promise so the rejection is observable when awaited.
@@ -465,6 +481,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     if (this.pending) {
       this.rejectPending(new OAuthFlowError("cancelled", "Flow cancelled"));
     } else {
+      this.authorizing = false;
       this.stopLoopback();
     }
   }
@@ -482,7 +499,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
    * again (which would throw "already in progress").
    */
   get hasPendingFlow(): boolean {
-    return this.pending !== null;
+    return this.pending !== null || this.authorizing;
   }
 
   // --- Loopback internals ---
@@ -492,14 +509,19 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     const server = createHttpServer((req, res) => {
       this.handleCallback(req.url ?? "/", res);
     });
-    this.server = server;
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(this.port, "127.0.0.1", () => {
-        server.removeListener("error", reject);
-        resolve();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(this.port, "127.0.0.1", () => {
+          server.removeListener("error", reject);
+          resolve();
+        });
       });
-    });
+      this.server = server;
+    } catch (err) {
+      server.close();
+      throw err;
+    }
   }
 
   private stopLoopback(): void {

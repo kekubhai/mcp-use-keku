@@ -157,4 +157,241 @@ describe("NodeOAuthClientProvider", () => {
     await expect(legacyCodePromise).resolves.toBe("authorization-code");
     expect(openBrowser).toHaveBeenCalledOnce();
   });
+
+  describe("concurrent redirectToAuthorization race condition (issue #2420)", () => {
+    it("rejects a second concurrent call while the first is still initializing", async () => {
+      const kv = new MemoryKVStore();
+      const provider = await NodeOAuthClientProvider.create(
+        "https://mcp.example.com/mcp",
+        {
+          kvStore: kv,
+          openBrowser: vi.fn(),
+          preferredPort: 36_000 + (process.pid % 1_000),
+          portRange: 100,
+        }
+      );
+
+      const authUrl = new URL("https://auth.example.com/authorize");
+      authUrl.searchParams.set("state", "s1");
+
+      // Start the first call but don't await it yet
+      const firstCall = provider.redirectToAuthorization(authUrl);
+
+      // A second call issued synchronously (before any microtask) must be
+      // rejected immediately because `authorizing` was set synchronously.
+      await expect(provider.redirectToAuthorization(authUrl)).rejects.toThrow(
+        "already in progress"
+      );
+
+      // Let the first call finish
+      await firstCall;
+      provider.dispose();
+    });
+
+    it("first flow's promise is not overwritten by the second call", async () => {
+      const kv = new MemoryKVStore();
+      const provider = await NodeOAuthClientProvider.create(
+        "https://mcp.example.com/mcp",
+        {
+          kvStore: kv,
+          openBrowser: vi.fn(),
+          preferredPort: 37_000 + (process.pid % 1_000),
+          portRange: 100,
+          authTimeoutMs: 5_000,
+        }
+      );
+
+      const authUrl1 = new URL("https://auth.example.com/authorize");
+      authUrl1.searchParams.set("state", "state1");
+
+      await provider.redirectToAuthorization(authUrl1);
+
+      // Grab the first promise before any concurrent attempt
+      const firstPromise = provider.getAuthorizationResponse();
+
+      // Send a callback for the first flow
+      const cb = new URL(`http://127.0.0.1:${provider.callbackPort}/callback`);
+      cb.searchParams.set("code", "code-from-flow-1");
+      cb.searchParams.set("state", "state1");
+      await fetch(cb);
+
+      // The original promise must resolve with the first flow's code
+      await expect(firstPromise).resolves.toEqual({
+        code: "code-from-flow-1",
+      });
+
+      // The second call was rejected so it never overwrote the first flow.
+      provider.dispose();
+    });
+
+    it("hasPendingFlow is true while authorizing (before pending is set)", async () => {
+      const kv = new MemoryKVStore();
+      const provider = await NodeOAuthClientProvider.create(
+        "https://mcp.example.com/mcp",
+        {
+          kvStore: kv,
+          openBrowser: vi.fn(),
+          preferredPort: 38_000 + (process.pid % 1_000),
+          portRange: 100,
+        }
+      );
+
+      expect(provider.hasPendingFlow).toBe(false);
+
+      const authUrl = new URL("https://auth.example.com/authorize");
+      authUrl.searchParams.set("state", "s1");
+
+      // Start the first call but don't await it yet
+      const firstCall = provider.redirectToAuthorization(authUrl);
+
+      // During the first call's initialization, hasPendingFlow must be true
+      // so that orchestrators don't start a duplicate auth() flow.
+      expect(provider.hasPendingFlow).toBe(true);
+
+      await firstCall;
+
+      // After loopback is up, pending is set — still true
+      expect(provider.hasPendingFlow).toBe(true);
+
+      provider.dispose();
+      expect(provider.hasPendingFlow).toBe(false);
+    });
+  });
+
+  describe("loopback startup failure cleanup (issue #2420)", () => {
+    it("releases pending reservation when startLoopback fails", async () => {
+      const kv = new MemoryKVStore();
+      const provider = await NodeOAuthClientProvider.create(
+        "https://mcp.example.com/mcp",
+        {
+          kvStore: kv,
+          openBrowser: vi.fn(),
+          preferredPort: 39_000 + (process.pid % 1_000),
+          portRange: 100,
+        }
+      );
+
+      // Occupy the port so that startLoopback() fails with EADDRINUSE
+      const blocker = createNetServer();
+      await new Promise<void>((resolve) =>
+        blocker.listen(provider.callbackPort, "127.0.0.1", resolve)
+      );
+
+      const authUrl = new URL("https://auth.example.com/authorize");
+      authUrl.searchParams.set("state", "s1");
+
+      // First call must fail because the port is occupied
+      await expect(provider.redirectToAuthorization(authUrl)).rejects.toThrow();
+
+      // The reservation must have been released
+      expect(provider.hasPendingFlow).toBe(false);
+
+      await new Promise<void>((resolve, reject) =>
+        blocker.close((err) => (err ? reject(err) : resolve()))
+      );
+      provider.dispose();
+    });
+
+    it("subsequent authorization attempt succeeds after a startup failure", async () => {
+      const kv = new MemoryKVStore();
+      const provider = await NodeOAuthClientProvider.create(
+        "https://mcp.example.com/mcp",
+        {
+          kvStore: kv,
+          openBrowser: vi.fn(),
+          preferredPort: 40_000 + (process.pid % 1_000),
+          portRange: 100,
+          authTimeoutMs: 5_000,
+        }
+      );
+
+      // Occupy the port to force a startup failure
+      const blocker = createNetServer();
+      await new Promise<void>((resolve) =>
+        blocker.listen(provider.callbackPort, "127.0.0.1", resolve)
+      );
+
+      const authUrl = new URL("https://auth.example.com/authorize");
+      authUrl.searchParams.set("state", "s1");
+
+      await expect(provider.redirectToAuthorization(authUrl)).rejects.toThrow();
+
+      // Release the port
+      await new Promise<void>((resolve, reject) =>
+        blocker.close((err) => (err ? reject(err) : resolve()))
+      );
+
+      // Now a second attempt should succeed
+      const authUrl2 = new URL("https://auth.example.com/authorize");
+      authUrl2.searchParams.set("state", "s2");
+      await provider.redirectToAuthorization(authUrl2);
+
+      expect(provider.hasPendingFlow).toBe(true);
+
+      // Verify the loopback is functional
+      const launcherUrl = `http://127.0.0.1:${provider.callbackPort}/authorize`;
+      const response = await fetch(launcherUrl, { redirect: "manual" });
+      expect(response.status).toBe(302);
+
+      provider.dispose();
+    });
+
+    it("hasPendingFlow resets to false after a startup failure", async () => {
+      const kv = new MemoryKVStore();
+      const provider = await NodeOAuthClientProvider.create(
+        "https://mcp.example.com/mcp",
+        {
+          kvStore: kv,
+          openBrowser: vi.fn(),
+          preferredPort: 41_000 + (process.pid % 1_000),
+          portRange: 100,
+        }
+      );
+
+      // Occupy the port to force failure
+      const blocker = createNetServer();
+      await new Promise<void>((resolve) =>
+        blocker.listen(provider.callbackPort, "127.0.0.1", resolve)
+      );
+
+      const authUrl = new URL("https://auth.example.com/authorize");
+      authUrl.searchParams.set("state", "s1");
+
+      await expect(provider.redirectToAuthorization(authUrl)).rejects.toThrow();
+
+      expect(provider.hasPendingFlow).toBe(false);
+
+      await new Promise<void>((resolve, reject) =>
+        blocker.close((err) => (err ? reject(err) : resolve()))
+      );
+      provider.dispose();
+    });
+  });
+
+  describe("dispose during authorizing state", () => {
+    it("clears authorizing flag so a subsequent call can proceed", async () => {
+      const kv = new MemoryKVStore();
+      const provider = await NodeOAuthClientProvider.create(
+        "https://mcp.example.com/mcp",
+        {
+          kvStore: kv,
+          openBrowser: vi.fn(),
+          preferredPort: 42_000 + (process.pid % 1_000),
+          portRange: 100,
+        }
+      );
+
+      const authUrl = new URL("https://auth.example.com/authorize");
+      authUrl.searchParams.set("state", "s1");
+
+      const firstCall = provider.redirectToAuthorization(authUrl);
+
+      // Dispose while authorizing is true but pending is not yet set
+      provider.dispose();
+
+      // First call should still resolve (dispose didn't break it)
+      await firstCall;
+      provider.dispose();
+    });
+  });
 });
